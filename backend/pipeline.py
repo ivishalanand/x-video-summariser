@@ -5,7 +5,7 @@ import os
 import re
 import uuid
 from pathlib import Path
-from typing import Tuple
+from typing import Callable, Tuple
 
 from anthropic import Anthropic
 from faster_whisper import WhisperModel
@@ -50,7 +50,11 @@ def _get_anthropic() -> Anthropic:
     return _anthropic
 
 
-def download_audio(url: str) -> Tuple[Path, float | None]:
+def download_audio(
+    url: str,
+    progress_hook: Callable[[dict], None] | None = None,
+    postprocess_hook: Callable[[dict], None] | None = None,
+) -> Tuple[Path, float | None]:
     """download audio; return (mp3 path, duration in seconds if known)."""
     validate_url(url)
     _TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -70,6 +74,10 @@ def download_audio(url: str) -> Tuple[Path, float | None]:
             }
         ],
     }
+    if progress_hook is not None:
+        options["progress_hooks"] = [progress_hook]
+    if postprocess_hook is not None:
+        options["postprocessor_hooks"] = [postprocess_hook]
     try:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)

@@ -110,6 +110,29 @@
     .step.active .cursor { display: inline; }
     @keyframes blink { 50% { opacity: 0; } }
 
+    .dl-bar {
+      height: 4px;
+      background: var(--bg-softer);
+      margin: 8px 0 0 1.8em;
+      overflow: hidden;
+      display: none;
+    }
+    .dl-bar.show { display: block; }
+    .dl-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.18s linear;
+    }
+    .dl-meta {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--fg-dim);
+      margin: 4px 0 0 1.8em;
+      display: none;
+    }
+    .dl-meta.show { display: block; }
+
     .block {
       position: relative;
       background: var(--bg-soft);
@@ -208,6 +231,8 @@
       <div class="steps">
         <div class="step" data-step="downloading">
           <span class="marker"></span>downloading<span class="cursor"> _</span>
+          <div class="dl-bar" id="dl-bar"><div class="dl-fill" id="dl-fill"></div></div>
+          <div class="dl-meta" id="dl-meta"></div>
         </div>
         <div class="step" data-step="transcribing">
           <span class="marker"></span>transcribing<span class="cursor"> _</span>
@@ -258,6 +283,9 @@
     const transcriptToggle = document.getElementById('transcript-toggle');
     const transcriptBlock = document.getElementById('transcript-block');
     const transcriptText = document.getElementById('transcript-text');
+    const dlBar = document.getElementById('dl-bar');
+    const dlFill = document.getElementById('dl-fill');
+    const dlMeta = document.getElementById('dl-meta');
 
     const STEPS = ['downloading', 'transcribing', 'summarizing'];
 
@@ -281,6 +309,37 @@
         el.classList.remove('active', 'done');
         el.querySelector('.marker').textContent = '';
       });
+      dlBar.classList.remove('show');
+      dlMeta.classList.remove('show');
+      dlFill.style.width = '0%';
+      dlMeta.textContent = '';
+    }
+
+    function formatBytes(n) {
+      if (n == null) return '?';
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / 1024 / 1024).toFixed(2)} MB`;
+    }
+
+    function handleDownloadProgress(p) {
+      dlBar.classList.add('show');
+      dlMeta.classList.add('show');
+      const pct = typeof p.percent === 'number' ? Math.min(100, p.percent) : 0;
+      dlFill.style.width = `${pct.toFixed(1)}%`;
+      if (p.phase === 'extracting') {
+        dlMeta.textContent = 'extracting audio...';
+        return;
+      }
+      const parts = [];
+      if (p.total != null) {
+        parts.push(`${formatBytes(p.downloaded)} / ${formatBytes(p.total)}`);
+      } else if (p.downloaded) {
+        parts.push(formatBytes(p.downloaded));
+      }
+      if (typeof p.percent === 'number') parts.push(`${p.percent.toFixed(1)}%`);
+      if (p.speed) parts.push(`${formatBytes(p.speed)}/s`);
+      dlMeta.textContent = parts.join(' · ');
     }
 
     function setStep(name, state) {
@@ -378,6 +437,8 @@
             try { payload = JSON.parse(raw); } catch { continue; }
             if (payload.type === 'progress') {
               advanceTo(payload.step);
+            } else if (payload.type === 'download_progress') {
+              handleDownloadProgress(payload);
             } else if (payload.type === 'warn') {
               warnEl.textContent = payload.message;
               warnEl.classList.add('show');
