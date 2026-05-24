@@ -453,9 +453,6 @@
       }
     }
 
-    const prefillUrl = new URLSearchParams(window.location.search).get('url');
-    if (prefillUrl && isValidUrl(prefillUrl)) urlInput.value = prefillUrl;
-
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       clearError();

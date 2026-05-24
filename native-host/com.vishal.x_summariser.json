@@ -1,7 +1,0 @@
-{
-  "name": "com.vishal.x_summariser",
-  "description": "x video summariser native host",
-  "path": "__HOST_PATH__",
-  "type": "stdio",
-  "allowed_origins": ["chrome-extension://__EXTENSION_ID__/"]
-}
