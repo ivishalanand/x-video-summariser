@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vid summarizer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0d0d0d;
+      --bg-soft: #161616;
+      --bg-softer: #1e1e1e;
+      --fg: #e8e8e8;
+      --fg-dim: #888;
+      --fg-dimmer: #555;
+      --accent: #f5a623;
+      --error: #ff6b6b;
+      --mono: 'JetBrains Mono', 'Menlo', monospace;
+      --sans: 'Inter', 'DM Sans', system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      background: var(--bg);
+      color: var(--fg);
+      margin: 0;
+      font-family: var(--sans);
+      -webkit-font-smoothing: antialiased;
+    }
+    body {
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 64px 24px;
+    }
+    main { width: 100%; max-width: 720px; }
+
+    .title {
+      font-family: var(--mono);
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--fg-dim);
+      letter-spacing: 0.04em;
+      margin-bottom: 40px;
+    }
+    .title .glyph { margin-right: 8px; }
+    .title .accent { color: var(--accent); }
+
+    .form {
+      display: flex;
+      gap: 12px;
+      flex-direction: column;
+    }
+    .url-input {
+      background: var(--bg-soft);
+      border: none;
+      color: var(--fg);
+      font-family: var(--mono);
+      font-size: 14px;
+      padding: 16px 18px;
+      width: 100%;
+      outline: none;
+      caret-color: var(--accent);
+    }
+    .url-input:focus { background: var(--bg-softer); }
+    .url-input::placeholder { color: var(--fg-dimmer); }
+    .url-input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .submit {
+      align-self: flex-start;
+      background: transparent;
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 500;
+      padding: 10px 22px;
+      cursor: pointer;
+      letter-spacing: 0.04em;
+      transition: background 0.12s ease, color 0.12s ease;
+    }
+    .submit:hover:not(:disabled) { background: var(--accent); color: var(--bg); }
+    .submit:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .section-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      text-transform: lowercase;
+      letter-spacing: 0.08em;
+      color: var(--fg-dimmer);
+      margin: 36px 0 12px;
+    }
+    .section-label::before { content: '── '; }
+
+    .progress { display: none; }
+    .progress.active { display: block; }
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+    .step { color: var(--fg-dimmer); }
+    .step.active { color: var(--accent); }
+    .step.done { color: var(--fg); }
+    .step .marker { display: inline-block; width: 1.8em; }
+    .step .cursor { color: var(--accent); animation: blink 1s steps(1) infinite; display: none; }
+    .step.active .cursor { display: inline; }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    .block {
+      position: relative;
+      background: var(--bg-soft);
+      padding: 18px 20px;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .block .copy {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: transparent;
+      border: 1px solid var(--fg-dimmer);
+      color: var(--fg-dim);
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 4px 10px;
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    }
+    .block:hover .copy, .block:focus-within .copy { opacity: 1; }
+    .block .copy:hover { color: var(--accent); border-color: var(--accent); }
+    .summary-text { font-family: var(--sans); white-space: pre-wrap; }
+    .transcript-text {
+      font-family: var(--mono);
+      font-size: 13px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .transcript-toggle {
+      cursor: pointer;
+      user-select: none;
+      color: var(--fg-dimmer);
+    }
+    .transcript-toggle:hover { color: var(--fg-dim); }
+    .transcript-toggle .chev {
+      display: inline-block;
+      transition: transform 0.15s ease;
+      margin-right: 4px;
+    }
+    .transcript-toggle.open .chev { transform: rotate(90deg); }
+    .transcript-block { display: none; }
+    .transcript-block.open { display: block; }
+
+    .error {
+      color: var(--error);
+      font-family: var(--mono);
+      font-size: 13px;
+      display: none;
+      margin-top: 4px;
+    }
+    .error.show { display: block; }
+    .duration {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--fg-dimmer);
+      margin-top: 8px;
+    }
+    .warn {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--accent);
+      margin-top: 8px;
+      display: none;
+    }
+    .warn.show { display: block; }
+
+    .result-section { display: none; }
+    .result-section.show { display: block; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="title">
+      <span class="glyph">🎬</span>vid <span class="accent">summarizer</span>
+    </div>
+
+    <form class="form" id="form" autocomplete="off">
+      <input
+        type="url"
+        class="url-input"
+        id="url"
+        placeholder="paste twitter/x url here..."
+        autocomplete="off"
+        spellcheck="false"
+        required>
+      <button type="submit" class="submit" id="submit">summarize</button>
+      <div class="error" id="error"></div>
+      <div class="warn" id="warn"></div>
+    </form>
+
+    <div class="progress" id="progress">
+      <div class="section-label">progress</div>
+      <div class="steps">
+        <div class="step" data-step="downloading">
+          <span class="marker"></span>downloading<span class="cursor"> _</span>
+        </div>
+        <div class="step" data-step="transcribing">
+          <span class="marker"></span>transcribing<span class="cursor"> _</span>
+        </div>
+        <div class="step" data-step="summarizing">
+          <span class="marker"></span>summarizing<span class="cursor"> _</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="result-section" id="summary-section">
+      <div class="section-label">summary</div>
+      <div class="block">
+        <button class="copy" data-target="summary-text" type="button">copy</button>
+        <div class="summary-text" id="summary-text"></div>
+      </div>
+      <div class="duration" id="duration"></div>
+    </div>
+
+    <div class="result-section" id="transcript-section">
+      <div class="section-label">
+        <span class="transcript-toggle" id="transcript-toggle"><span class="chev">▸</span>transcript</span>
+      </div>
+      <div class="block transcript-block" id="transcript-block">
+        <button class="copy" data-target="transcript-text" type="button">copy</button>
+        <div class="transcript-text" id="transcript-text"></div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const URL_PATTERNS = [
+      /^https:\/\/(?:www\.)?x\.com\/[^/]+\/status\/\d+(?:[/?].*)?$/i,
+      /^https:\/\/(?:www\.)?twitter\.com\/[^/]+\/status\/\d+(?:[/?].*)?$/i,
+      /^https:\/\/t\.co\/[A-Za-z0-9_-]+$/i,
+    ];
+
+    const form = document.getElementById('form');
+    const urlInput = document.getElementById('url');
+    const submitBtn = document.getElementById('submit');
+    const errorEl = document.getElementById('error');
+    const warnEl = document.getElementById('warn');
+    const progressEl = document.getElementById('progress');
+    const summarySection = document.getElementById('summary-section');
+    const summaryText = document.getElementById('summary-text');
+    const durationEl = document.getElementById('duration');
+    const transcriptSection = document.getElementById('transcript-section');
+    const transcriptToggle = document.getElementById('transcript-toggle');
+    const transcriptBlock = document.getElementById('transcript-block');
+    const transcriptText = document.getElementById('transcript-text');
+
+    const STEPS = ['downloading', 'transcribing', 'summarizing'];
+
+    const isValidUrl = (u) => URL_PATTERNS.some((p) => p.test(u.trim()));
+
+    function showError(msg) {
+      errorEl.textContent = msg;
+      errorEl.classList.add('show');
+    }
+    function clearError() {
+      errorEl.textContent = '';
+      errorEl.classList.remove('show');
+    }
+    function clearWarn() {
+      warnEl.textContent = '';
+      warnEl.classList.remove('show');
+    }
+
+    function resetSteps() {
+      document.querySelectorAll('.step').forEach((el) => {
+        el.classList.remove('active', 'done');
+        el.querySelector('.marker').textContent = '';
+      });
+    }
+
+    function setStep(name, state) {
+      const el = document.querySelector(`.step[data-step="${name}"]`);
+      if (!el) return;
+      el.classList.remove('active', 'done');
+      const marker = el.querySelector('.marker');
+      if (state === 'active') {
+        el.classList.add('active');
+        marker.textContent = '◌ ';
+      } else if (state === 'done') {
+        el.classList.add('done');
+        marker.textContent = '✓ ';
+      }
+    }
+
+    function advanceTo(step) {
+      const idx = STEPS.indexOf(step);
+      if (idx < 0) return;
+      for (let i = 0; i < idx; i++) setStep(STEPS[i], 'done');
+      setStep(step, 'active');
+    }
+
+    function setRunning(running) {
+      submitBtn.disabled = running;
+      urlInput.disabled = running;
+      submitBtn.textContent = running ? 'working...' : 'summarize';
+    }
+
+    function formatDuration(s) {
+      if (!s) return '';
+      const sec = Math.round(s);
+      if (sec < 60) return `${sec}s`;
+      const m = Math.floor(sec / 60);
+      const r = sec % 60;
+      return r ? `${m}m ${r}s` : `${m}m`;
+    }
+
+    function handleDone(payload) {
+      STEPS.forEach((s) => setStep(s, 'done'));
+      summaryText.textContent = payload.summary || '';
+      summarySection.classList.add('show');
+      durationEl.textContent = payload.duration_seconds
+        ? `video duration: ${formatDuration(payload.duration_seconds)}`
+        : '';
+      transcriptText.textContent = payload.transcript || '(no transcript)';
+      transcriptSection.classList.add('show');
+    }
+
+    transcriptToggle.addEventListener('click', () => {
+      const open = transcriptToggle.classList.toggle('open');
+      transcriptBlock.classList.toggle('open', open);
+    });
+
+    document.body.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.copy');
+      if (!btn) return;
+      const target = document.getElementById(btn.dataset.target);
+      if (!target) return;
+      try {
+        await navigator.clipboard.writeText(target.textContent);
+        const orig = btn.textContent;
+        btn.textContent = 'copied!';
+        setTimeout(() => { btn.textContent = orig; }, 1200);
+      } catch {
+        btn.textContent = 'failed';
+      }
+    });
+
+    async function streamSummarize(url) {
+      const resp = await fetch('/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify({ url }),
+      });
+      if (!resp.ok || !resp.body) {
+        throw new Error(`server error (${resp.status})`);
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let sep;
+        while ((sep = buf.indexOf('\n\n')) >= 0) {
+          const chunk = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          for (const line of chunk.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            const raw = line.slice(5).trim();
+            if (!raw) continue;
+            let payload;
+            try { payload = JSON.parse(raw); } catch { continue; }
+            if (payload.type === 'progress') {
+              advanceTo(payload.step);
+            } else if (payload.type === 'warn') {
+              warnEl.textContent = payload.message;
+              warnEl.classList.add('show');
+            } else if (payload.type === 'done') {
+              handleDone(payload);
+              return;
+            } else if (payload.type === 'error') {
+              throw new Error(payload.message);
+            }
+          }
+        }
+      }
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      clearError();
+      clearWarn();
+
+      const url = urlInput.value.trim();
+      if (!isValidUrl(url)) {
+        showError('please enter a valid twitter/x status URL');
+        return;
+      }
+
+      resetSteps();
+      summarySection.classList.remove('show');
+      transcriptSection.classList.remove('show');
+      transcriptToggle.classList.remove('open');
+      transcriptBlock.classList.remove('open');
+      progressEl.classList.add('active');
+      setRunning(true);
+
+      try {
+        await streamSummarize(url);
+      } catch (err) {
+        showError(err.message || 'something went wrong');
+      } finally {
+        setRunning(false);
+        document.querySelectorAll('.step.active').forEach((el) => {
+          el.classList.remove('active');
+        });
+      }
+    });
+  </script>
+</body>
+</html>
