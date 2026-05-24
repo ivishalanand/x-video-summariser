@@ -41,6 +41,29 @@ uvicorn main:app --reload --port 8000
 then open <http://localhost:8000>. paste a twitter/x video URL and hit
 **summarize**.
 
+### chrome / arc extension (on-demand)
+
+a side-panel extension that auto-starts the backend the first time you click
+it. uses chrome native messaging so the server only runs when needed.
+
+1. **load the extension** — open `chrome://extensions` (or `arc://extensions`),
+   enable *developer mode*, click *load unpacked*, select the `extension/`
+   directory. copy the extension ID shown under the name (32 lowercase
+   letters).
+2. **install the native host** — from the repo root:
+   ```bash
+   ./native-host/install.sh <extension-id>
+   ```
+   this writes a manifest into your browser's `NativeMessagingHosts/` dir
+   pointing at `native-host/host.py`. supports chrome, arc, chromium, and
+   brave.
+3. **use it** — open a tweet with a video, click the extension's toolbar
+   icon. the side panel opens, the host script starts uvicorn detached if
+   it's not already up, and the UI loads with the tweet URL pre-filled.
+
+if something fails, check `~/.x_summariser_venv/uvicorn.log` — that's where
+the detached server writes its output.
+
 ### run in claude cowork
 
 the repo ships a [`.claude/launch.json`](.claude/launch.json) that wires the
