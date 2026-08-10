@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-from pipeline import download_audio, summarize, transcribe, validate_url  # noqa: E402
+from pipeline import chat_stream, download_audio, summarize, transcribe, validate_url  # noqa: E402
 
 FRONTEND_DIR = (Path(__file__).resolve().parent.parent / "frontend").resolve()
 
@@ -28,9 +28,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="x_summariser", lifespan=lifespan)
 
+# Only transcription is CPU-bound; downloads can run in parallel so we
+# serialise only the Whisper step with a semaphore.
+_transcribe_sem = asyncio.Semaphore(1)
+
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+
 
 class SummarizeRequest(BaseModel):
     url: str
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    transcript: str
+    messages: list[ChatMessage]
 
 
 def _sse(payload: dict) -> str:
@@ -111,8 +128,49 @@ async def post_summarize(req: SummarizeRequest):
                     }
                 )
 
+            # Signal transcribing step (may queue briefly if another video is
+            # already transcribing — semaphore keeps Whisper single-threaded).
             yield _sse({"type": "progress", "step": "transcribing", "message": "Transcribing audio..."})
-            transcript, duration = await asyncio.to_thread(transcribe, audio_path)
+
+            async with _transcribe_sem:
+                transcribe_queue: asyncio.Queue[dict] = asyncio.Queue()
+                last_tx_emit = 0.0
+
+                def on_transcribe(d: dict) -> None:
+                    nonlocal last_tx_emit
+                    now = loop.time()
+                    if now - last_tx_emit < 0.15:
+                        return
+                    last_tx_emit = now
+                    loop.call_soon_threadsafe(
+                        transcribe_queue.put_nowait,
+                        {
+                            "type": "transcribe_progress",
+                            "current": d.get("current"),
+                            "total": d.get("total"),
+                            "percent": d.get("percent"),
+                        },
+                    )
+
+                transcribe_task = asyncio.create_task(
+                    asyncio.to_thread(transcribe, audio_path, on_transcribe)
+                )
+                while not transcribe_task.done():
+                    get_task = asyncio.create_task(transcribe_queue.get())
+                    done, _ = await asyncio.wait(
+                        {transcribe_task, get_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if get_task in done:
+                        yield _sse(get_task.result())
+                    else:
+                        get_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await get_task
+                while not transcribe_queue.empty():
+                    yield _sse(transcribe_queue.get_nowait())
+                transcript, duration = transcribe_task.result()
+
             if not duration and dl_duration:
                 duration = dl_duration
 
@@ -142,6 +200,28 @@ async def post_summarize(req: SummarizeRequest):
         "Connection": "keep-alive",
     }
     return StreamingResponse(stream(), media_type="text/event-stream", headers=headers)
+
+
+@app.post("/chat")
+async def post_chat(req: ChatRequest):
+    async def event_stream():
+        try:
+            messages = [m.model_dump() for m in req.messages]
+            if not messages or messages[-1]["role"] != "user":
+                yield _sse({"type": "error", "message": "last message must be from user"})
+                return
+            async for chunk in chat_stream(req.transcript, messages):
+                yield _sse({"type": "token", "text": chunk})
+            yield _sse({"type": "done"})
+        except Exception as exc:
+            yield _sse({"type": "error", "message": str(exc) or "unexpected error"})
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
 
 
 @app.get("/")

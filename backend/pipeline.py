@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Tuple
 
-from anthropic import Anthropic
+from anthropic import Anthropic, AsyncAnthropic
 from faster_whisper import WhisperModel
 from yt_dlp import YoutubeDL
 
@@ -23,6 +23,7 @@ _ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 _whisper: WhisperModel | None = None
 _anthropic: Anthropic | None = None
+_async_anthropic: AsyncAnthropic | None = None
 
 
 def validate_url(url: str) -> None:
@@ -48,6 +49,15 @@ def _get_anthropic() -> Anthropic:
             raise RuntimeError("ANTHROPIC_API_KEY is not set")
         _anthropic = Anthropic()
     return _anthropic
+
+
+def _get_async_anthropic() -> AsyncAnthropic:
+    global _async_anthropic
+    if _async_anthropic is None:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("ANTHROPIC_API_KEY is not set")
+        _async_anthropic = AsyncAnthropic()
+    return _async_anthropic
 
 
 def download_audio(
@@ -93,12 +103,25 @@ def download_audio(
     return out_path, duration
 
 
-def transcribe(audio_path: Path) -> Tuple[str, float]:
+def transcribe(
+    audio_path: Path,
+    progress_hook: Callable[[dict], None] | None = None,
+) -> Tuple[str, float]:
     model = _get_whisper()
     segments, info = model.transcribe(str(audio_path), beam_size=5)
-    text = " ".join(seg.text.strip() for seg in segments).strip()
     duration = float(info.duration or 0.0)
-    return text, duration
+    texts: list[str] = []
+    for seg in segments:
+        texts.append(seg.text.strip())
+        if progress_hook is not None:
+            progress_hook(
+                {
+                    "current": float(seg.end),
+                    "total": duration,
+                    "percent": (float(seg.end) / duration * 100) if duration else None,
+                }
+            )
+    return " ".join(texts).strip(), duration
 
 
 _SUMMARIZER_SYSTEM = (
@@ -120,3 +143,33 @@ def summarize(transcript: str) -> str:
     )
     parts = [b.text for b in msg.content if getattr(b, "type", None) == "text"]
     return "\n".join(parts).strip()
+
+
+_CHAT_SYSTEM_TEMPLATE = (
+    "You are a helpful assistant answering questions about a video the user just "
+    "watched. Be concise and direct. Quote from the transcript when it sharpens the "
+    "answer. If something isn't in the transcript, say so plainly. "
+    "Format your responses in markdown — use lists, bold, headings, and code blocks "
+    "where they aid clarity.\n\n"
+    "<transcript>\n{transcript}\n</transcript>"
+)
+
+
+async def chat_stream(transcript: str, messages: list[dict]):
+    """yield assistant text tokens for a chat turn over a transcript."""
+    client = _get_async_anthropic()
+    system = [
+        {
+            "type": "text",
+            "text": _CHAT_SYSTEM_TEMPLATE.format(transcript=transcript or "(no transcript available)"),
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    async with client.messages.stream(
+        model=_ANTHROPIC_MODEL,
+        max_tokens=1024,
+        system=system,
+        messages=messages,
+    ) as stream:
+        async for text in stream.text_stream:
+            yield text
