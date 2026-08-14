@@ -289,7 +289,9 @@ a.curl:hover { color: #f5a623; text-decoration: underline; }
   background: transparent; border: none; color: #3a3a3a; font-size: 11px;
   cursor: pointer; padding: 2px 4px; display: none; transition: color .12s; flex-shrink: 0;
 }
-.card.done .ctog { display: block; }
+.card.done .ctog { display: block; color: #666; }
+.card.done .card-hd { cursor: pointer; }
+.card.done .card-hd:hover .ctog { color: #f5a623; }
 .ctog:hover { color: #f5a623; }
 .cdel {
   background: transparent; border: none; color: #2a2a2a; font-size: 10px;
@@ -684,11 +686,14 @@ async function hydrate() {
     const got = await chrome.storage.local.get(STORE_KEY);
     recs = (got && got[STORE_KEY]) || [];
   } catch { return; }
+  let newest = null;
   for (const rec of byAge(recs.filter(r => r && r.url))) {
     if (history.has(rec.url)) continue;
     history.set(rec.url, rec);
-    if (!queue.some(i => i.url === rec.url)) restoreCard(rec);
+    if (!queue.some(i => i.url === rec.url)) newest = restoreCard(rec) || newest;
   }
+  // the last video summarised is the one he came back for — open it
+  newest?.setExpanded?.(true);
 }
 
 try {
@@ -778,12 +783,19 @@ function buildCard(item) {
   // drop from the sidebar and from history
   c.querySelector(`#del-${id}`).addEventListener('click', () => forget(item));
 
-  // expand toggle
+  // expand toggle — the whole header is the hit area, the caret alone was a
+  // 10px target nobody could find on a restored card
   const tog = c.querySelector(`#tog-${id}`);
-  tog.addEventListener('click', () => {
-    item.expanded = !item.expanded;
-    c.classList.toggle('expanded', item.expanded);
-    tog.textContent = item.expanded ? '▴' : '▾';
+  const setExpanded = v => {
+    item.expanded = v;
+    c.classList.toggle('expanded', v);
+    tog.textContent = v ? '▴' : '▾';
+  };
+  item.setExpanded = setExpanded;
+  c.querySelector('.card-hd').addEventListener('click', e => {
+    if (e.target.closest('a') || e.target.closest('.cdel')) return;   // link and delete keep their own jobs
+    if (item.status !== 'done') return;
+    setExpanded(!item.expanded);
   });
 
   // copy
@@ -974,7 +986,15 @@ function setBusy(item, v) {
 }
 
 async function chatItem(item, q) {
-  if (!q || item.chatBusy || !item.transcript) return;
+  if (!q || item.chatBusy) return;
+  // used to return silently here, which looked like a dead chat box
+  if (!item.transcript) {
+    appendMsg(item, 'user', q);
+    const { w, t } = appendMsg(item, 'assistant', '');
+    w.classList.add('error');
+    t.textContent = '[error] no transcript stored for this video — summarise it again to chat about it';
+    return;
+  }
   $(`chips-${item.id}`)?.classList.add('gone');
   item.messages.push({ role: 'user', content: q });
   appendMsg(item, 'user', q);
