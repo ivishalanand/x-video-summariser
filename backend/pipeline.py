@@ -26,6 +26,15 @@ _anthropic: Anthropic | None = None
 _async_anthropic: AsyncAnthropic | None = None
 
 
+class Cancelled(Exception):
+    """raised on the worker thread when a job is stopped from the sidebar."""
+
+
+def _check(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise Cancelled()
+
+
 def validate_url(url: str) -> None:
     if not isinstance(url, str) or not url.strip():
         raise ValueError("URL is required")
@@ -64,9 +73,11 @@ def download_audio(
     url: str,
     progress_hook: Callable[[dict], None] | None = None,
     postprocess_hook: Callable[[dict], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> Tuple[Path, float | None]:
     """download audio; return (mp3 path, duration in seconds if known)."""
     validate_url(url)
+    _check(should_cancel)
     _TEMP_DIR.mkdir(parents=True, exist_ok=True)
     job_id = uuid.uuid4().hex
     out_template = str(_TEMP_DIR / f"{job_id}.%(ext)s")
@@ -84,17 +95,29 @@ def download_audio(
             }
         ],
     }
-    if progress_hook is not None:
-        options["progress_hooks"] = [progress_hook]
-    if postprocess_hook is not None:
-        options["postprocessor_hooks"] = [postprocess_hook]
+    # yt-dlp lets an exception from a hook abort the download, which is the only
+    # way to stop it mid-transfer — there is no kill switch on the worker thread.
+    def _hook(inner: Callable[[dict], None] | None) -> Callable[[dict], None]:
+        def wrapped(d: dict) -> None:
+            _check(should_cancel)
+            if inner is not None:
+                inner(d)
+        return wrapped
+
+    options["progress_hooks"] = [_hook(progress_hook)]
+    options["postprocessor_hooks"] = [_hook(postprocess_hook)]
     try:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
+    except Cancelled:
+        raise
     except Exception as exc:
+        if isinstance(exc.__cause__, Cancelled) or isinstance(exc.__context__, Cancelled):
+            raise Cancelled() from exc
         raise RuntimeError(
             "couldn't download video — it may be private, deleted, or unsupported"
         ) from exc
+    _check(should_cancel)
     out_path = _TEMP_DIR / f"{job_id}.mp3"
     if not out_path.exists():
         raise RuntimeError("audio extraction failed — is ffmpeg installed?")
@@ -106,12 +129,17 @@ def download_audio(
 def transcribe(
     audio_path: Path,
     progress_hook: Callable[[dict], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> Tuple[str, float]:
+    _check(should_cancel)
     model = _get_whisper()
     segments, info = model.transcribe(str(audio_path), beam_size=5)
     duration = float(info.duration or 0.0)
     texts: list[str] = []
     for seg in segments:
+        # segments are lazy, so this both stops the work and releases the
+        # semaphore the next video is waiting on
+        _check(should_cancel)
         texts.append(seg.text.strip())
         if progress_hook is not None:
             progress_hook(

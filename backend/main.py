@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -14,7 +15,14 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-from pipeline import chat_stream, download_audio, summarize, transcribe, validate_url  # noqa: E402
+from pipeline import (  # noqa: E402
+    Cancelled,
+    chat_stream,
+    download_audio,
+    summarize,
+    transcribe,
+    validate_url,
+)
 
 FRONTEND_DIR = (Path(__file__).resolve().parent.parent / "frontend").resolve()
 
@@ -32,12 +40,23 @@ app = FastAPI(title="x_summariser", lifespan=lifespan)
 # serialise only the Whisper step with a semaphore.
 _transcribe_sem = asyncio.Semaphore(1)
 
+# Stopping a job has to reach the worker threads: a thread can't be killed, so
+# yt-dlp and Whisper poll this flag and raise Cancelled. Keyed by the job id the
+# sidebar generates. Closing the tab trips the same flag via the finally below,
+# so a refresh mid-transcribe no longer leaves Whisper running.
+_cancels: dict[str, threading.Event] = {}
+
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
 
 
 class SummarizeRequest(BaseModel):
     url: str
+    job_id: str | None = None
+
+
+class CancelRequest(BaseModel):
+    job_id: str
 
 
 class ChatMessage(BaseModel):
@@ -59,8 +78,23 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+@app.post("/cancel")
+async def post_cancel(req: CancelRequest) -> dict:
+    ev = _cancels.get(req.job_id)
+    if ev is None:
+        return {"ok": False, "reason": "unknown or already finished job"}
+    ev.set()
+    return {"ok": True}
+
+
 @app.post("/summarize")
 async def post_summarize(req: SummarizeRequest):
+    job_id = req.job_id
+    cancel = threading.Event()
+    if job_id:
+        _cancels[job_id] = cancel
+    should_cancel = cancel.is_set
+
     async def stream():
         audio_path: Path | None = None
         try:
@@ -102,7 +136,7 @@ async def post_summarize(req: SummarizeRequest):
                     )
 
             download_task = asyncio.create_task(
-                asyncio.to_thread(download_audio, req.url, on_progress)
+                asyncio.to_thread(download_audio, req.url, on_progress, None, should_cancel)
             )
             while not download_task.done():
                 get_task = asyncio.create_task(progress_queue.get())
@@ -153,7 +187,7 @@ async def post_summarize(req: SummarizeRequest):
                     )
 
                 transcribe_task = asyncio.create_task(
-                    asyncio.to_thread(transcribe, audio_path, on_transcribe)
+                    asyncio.to_thread(transcribe, audio_path, on_transcribe, should_cancel)
                 )
                 while not transcribe_task.done():
                     get_task = asyncio.create_task(transcribe_queue.get())
@@ -175,6 +209,8 @@ async def post_summarize(req: SummarizeRequest):
                 duration = dl_duration
 
             yield _sse({"type": "progress", "step": "summarizing", "message": "Summarizing..."})
+            if should_cancel():
+                raise Cancelled()
             summary_text = await asyncio.to_thread(summarize, transcript)
 
             yield _sse(
@@ -185,11 +221,20 @@ async def post_summarize(req: SummarizeRequest):
                     "duration_seconds": duration,
                 }
             )
+        except Cancelled:
+            # the sidebar already dropped the card; this is just a clean exit
+            with suppress(Exception):
+                yield _sse({"type": "cancelled"})
         except ValueError as exc:
             yield _sse({"type": "error", "message": str(exc)})
         except Exception as exc:
             yield _sse({"type": "error", "message": str(exc) or "unexpected error"})
         finally:
+            # covers every exit, including the client closing the tab: whatever
+            # is still on a worker thread stops at its next checkpoint
+            cancel.set()
+            if job_id:
+                _cancels.pop(job_id, None)
             if audio_path is not None:
                 with suppress(FileNotFoundError):
                     os.unlink(audio_path)

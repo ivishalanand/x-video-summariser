@@ -297,7 +297,8 @@ a.curl:hover { color: #f5a623; text-decoration: underline; }
   background: transparent; border: none; color: #2a2a2a; font-size: 10px;
   cursor: pointer; padding: 2px 3px; display: none; transition: color .12s; flex-shrink: 0;
 }
-.card.done .cdel, .card.err .cdel { display: block; }
+.card.done .cdel, .card.err .cdel, .card.processing .cdel { display: block; }
+.card.processing .cdel { color: #3a3a3a; }
 .cdel:hover { color: #ff6b6b; }
 
 /* progress inside card */
@@ -549,6 +550,7 @@ function retryItem(item) {
   c.className = 'card processing';
   const ico = $(`ico-${item.id}`); if (ico) { ico.textContent = '◌'; ico.classList.add('spin'); }
   const err = $(`cerr-${item.id}`); if (err) err.textContent = '';
+  const del = $(`del-${item.id}`); if (del) del.title = 'stop';
   processItem(item);
 }
 
@@ -780,8 +782,12 @@ function buildCard(item) {
     });
   });
 
-  // drop from the sidebar and from history
-  c.querySelector(`#del-${id}`).addEventListener('click', () => forget(item));
+  // stop a running job, or drop a finished one from history
+  const del = c.querySelector(`#del-${id}`);
+  del.title = item.status === 'processing' ? 'stop' : 'remove from history';
+  del.addEventListener('click', () => {
+    if (item.status === 'processing') stopItem(item); else forget(item);
+  });
 
   // expand toggle — the whole header is the hit area, the caret alone was a
   // 10px target nobody could find on a restored card
@@ -866,6 +872,7 @@ function fillCard(item, expand) {
   c.className = expand ? 'card done expanded' : 'card done';
   const ico = $(`ico-${item.id}`); if (ico) { ico.textContent = '✓'; ico.classList.remove('spin'); }
   const tog = $(`tog-${item.id}`); if (tog) tog.textContent = expand ? '▴' : '▾';
+  const del = $(`del-${item.id}`); if (del) del.title = 'remove from history';
   const sum = $(`csum-${item.id}`); if (sum) renderMd(sum, item.summary);
   const tx  = $(`ctx-${item.id}`);  if (tx)  tx.textContent  = item.transcript;
   const dur = $(`cdur-${item.id}`); if (dur) dur.textContent = item.duration ? `video duration: ${fmtSecs(item.duration)}` : '';
@@ -929,15 +936,22 @@ function addToQueue(url) {
 }
 
 async function processItem(item) {
+  // fresh per attempt, so a retry after a stop gets its own job
+  item.jobId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${uid()}`;
+  item.ctrl = new AbortController();
   try {
     let resp;
     try {
       resp = await fetch(`${BACKEND}/summarize`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: item.url }),
+        body: JSON.stringify({ url: item.url, job_id: item.jobId }),
+        signal: item.ctrl.signal,
       });
-    } catch { throw new Error('cannot reach backend — is it running on port 47291?'); }
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      throw new Error('cannot reach backend — is it running on port 47291?');
+    }
     if (!resp.ok || !resp.body) throw new Error(`backend error (${resp.status})`);
     const reader = resp.body.getReader(), dec = new TextDecoder();
     let buf = '';
@@ -958,11 +972,35 @@ async function processItem(item) {
             item.summary = p.summary || ''; item.transcript = p.transcript || ''; item.duration = p.duration_seconds || null;
             item.status = 'done'; markDone(item); return;
           }
+          else if (p.type === 'cancelled') return;
           else if (p.type === 'error') throw new Error(p.message);
         }
       }
     }
-  } catch (err) { item.status = 'error'; markErr(item, err.message || 'something went wrong'); }
+  } catch (err) {
+    if (err.name === 'AbortError' || item.status === 'stopped') return;
+    item.status = 'error'; markErr(item, err.message || 'something went wrong');
+  }
+}
+
+// Stop a running job. Aborting the fetch only frees this tab — the backend is
+// still downloading or transcribing on a worker thread, and a thread can't be
+// killed, so /cancel trips a flag it polls at its next checkpoint.
+function stopItem(item) {
+  item.status = 'stopped';
+  try { item.ctrl?.abort(); } catch {}
+  if (item.jobId) {
+    fetch(`${BACKEND}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: item.jobId }),
+      keepalive: true,
+    }).catch(() => {});
+  }
+  const i = queue.indexOf(item);
+  if (i >= 0) queue.splice(i, 1);
+  item.el?.remove();
+  if (!queue.length) emptyEl.style.display = '';
 }
 
 // ─── per-card chat ────────────────────────────────────────────────────────────
