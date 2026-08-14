@@ -35,7 +35,8 @@ function tweetUrlForVideo(video) {
 
 function isValidUrl(u) {
   const s = u.trim();
-  return /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/.test(s)
+  // anchored — the url ends up in an href, so no trailing junk allowed
+  return /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+(?:[/?#][^\s"'<>]*)?$/.test(s)
       || /^https:\/\/t\.co\/[A-Za-z0-9_-]+$/.test(s);
 }
 
@@ -57,6 +58,94 @@ function fmtBytes(n) {
 function shortUrl(url) {
   const user = url.match(/\.com\/([^/]+)\/status\/(\d+)/);
   return user ? `@${user[1]}  ·  …${user[2].slice(-6)}` : url.replace(/^https?:\/\//, '').slice(0, 34);
+}
+
+// ─── markdown ─────────────────────────────────────────────────────────────────
+// Claude answers in markdown. MV3 forbids remote code and x.com's CSP blocks
+// CDN scripts, so this is a small subset renderer instead of a bundled library.
+// Everything is HTML-escaped before any tag is produced — model output and
+// transcripts are untrusted text.
+
+const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const esc = s => String(s).replace(/[&<>"']/g, ch => ESCAPES[ch]);
+
+// only http(s) links survive — no javascript:/data: hrefs
+const safeHref = u => /^https?:\/\//i.test(u) ? u : '';
+
+function mdInline(s) {
+  return s
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*\w])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    .replace(/(^|[^_\w])_([^_\n]+)_/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
+      const href = safeHref(url);
+      return href ? `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>` : m;
+    });
+}
+
+function mdToHtml(src) {
+  if (!src) return '';
+  // placeholders below are NUL-delimited — strip any NUL the model or
+  // transcript smuggles in so it cannot forge one
+  let s = String(src).replace(/\u0000/g, '').replace(/\r\n?/g, '\n');
+
+  // mid-stream the closing fence hasn't arrived yet — close it ourselves
+  if ((s.match(/```/g) || []).length % 2) s += '\n```';
+
+  // pull fenced code out before escaping so inline rules never touch it
+  const fences = [];
+  s = s.replace(/```[a-zA-Z0-9_+-]*\n?([\s\S]*?)```/g, (_, code) => {
+    fences.push(code.replace(/\n$/, ''));
+    return `\n\u0000F${fences.length - 1}\u0000\n`;
+  });
+
+  s = esc(s);
+
+  const codes = [];
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return `\u0000C${codes.length - 1}\u0000`; });
+
+  const out = [];
+  let para = [], list = null;
+  const flushPara = () => { if (para.length) { out.push(`<p>${mdInline(para.join('<br>'))}</p>`); para = []; } };
+  const closeList = () => { if (list) { out.push(`</${list}>`); list = null; } };
+
+  for (const raw of s.split('\n')) {
+    const line = raw.trimEnd();
+    const fence = line.trim().match(/^\u0000F(\d+)\u0000$/);
+    if (fence) { flushPara(); closeList(); out.push(`<pre><code>${esc(fences[+fence[1]])}</code></pre>`); continue; }
+    if (!line.trim()) { flushPara(); closeList(); continue; }
+
+    let m;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      flushPara(); closeList();
+      const lvl = Math.min(m[1].length + 2, 6);
+      out.push(`<h${lvl}>${mdInline(m[2])}</h${lvl}>`); continue;
+    }
+    if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(line.trim())) { flushPara(); closeList(); out.push('<hr>'); continue; }
+    if ((m = line.match(/^\s*&gt;\s?(.*)$/))) { flushPara(); closeList(); out.push(`<blockquote>${mdInline(m[1])}</blockquote>`); continue; }
+    if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) {
+      flushPara();
+      if (list !== 'ul') { closeList(); out.push('<ul>'); list = 'ul'; }
+      out.push(`<li>${mdInline(m[1])}</li>`); continue;
+    }
+    if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      flushPara();
+      if (list !== 'ol') { closeList(); out.push('<ol>'); list = 'ol'; }
+      out.push(`<li>${mdInline(m[1])}</li>`); continue;
+    }
+    closeList();
+    para.push(line);
+  }
+  flushPara(); closeList();
+
+  return out.join('')
+    .replace(/\u0000C(\d+)\u0000/g, (_, i) => `<code>${codes[+i]}</code>`);
+}
+
+function renderMd(el, text) {
+  if (!el) return;
+  el.classList.add('md');
+  el.innerHTML = mdToHtml(text);
 }
 
 // ─── shadow DOM ───────────────────────────────────────────────────────────────
@@ -177,6 +266,8 @@ style.textContent = `
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .card.done .curl, .card.processing .curl { color: #888; }
+a.curl { text-decoration: none; }
+a.curl:hover { color: #f5a623; text-decoration: underline; }
 .ctog {
   background: transparent; border: none; color: #3a3a3a; font-size: 11px;
   cursor: pointer; padding: 2px 4px; display: none; transition: color .12s; flex-shrink: 0;
@@ -229,6 +320,12 @@ style.textContent = `
 .csum { font-size: 13px; line-height: 1.65; white-space: pre-wrap; }
 .ctx  { font-family: 'JetBrains Mono','Menlo',monospace; font-size: 11px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
 .cdur { font-family: 'JetBrains Mono','Menlo',monospace; font-size: 10px; color: #333; margin-top: 6px; }
+.csrc {
+  display: inline-block; margin-top: 4px;
+  font-family: 'JetBrains Mono','Menlo',monospace; font-size: 10px; letter-spacing: .04em;
+  color: #3a3a3a; text-decoration: none; transition: color .12s;
+}
+.csrc:hover { color: #f5a623; }
 
 .ccopy {
   float: right; margin: 0 0 6px 8px;
@@ -278,6 +375,25 @@ style.textContent = `
 }
 .ccs:hover:not(:disabled) { background: #f5a623; color: #0d0d0d; }
 .ccs:disabled { opacity: .4; cursor: not-allowed; }
+
+/* rendered markdown — last in the sheet so it beats the pre-wrap on
+   .csum and .cmsg-c, which have the same specificity */
+.md { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child  { margin-bottom: 0; }
+.md p { margin: 6px 0; }
+.md h3, .md h4, .md h5, .md h6 { font-size: 12px; font-weight: 500; color: #e8e8e8; margin: 10px 0 4px; letter-spacing: .02em; }
+.md ul, .md ol { margin: 6px 0; padding-left: 1.3em; }
+.md li { margin: 2px 0; }
+.md strong { font-weight: 500; color: #fff; }
+.md em { font-style: italic; }
+.md a { color: #f5a623; text-decoration: none; border-bottom: 1px solid #f5a62355; }
+.md a:hover { border-bottom-color: #f5a623; }
+.md code { font-family: 'JetBrains Mono','Menlo',monospace; font-size: 11px; background: #1a1a1a; color: #f5a623; padding: 1px 4px; }
+.md pre { background: #161616; padding: 8px 10px; margin: 6px 0; overflow-x: auto; }
+.md pre code { background: transparent; color: #d8d8d8; padding: 0; }
+.md blockquote { border-left: 2px solid #2a2a2a; padding-left: 8px; margin: 6px 0; color: #888; }
+.md hr { border: none; border-top: 1px solid #1e1e1e; margin: 8px 0; }
 `;
 
 const sidebar = document.createElement('div');
@@ -451,7 +567,7 @@ function buildCard(item) {
   c.innerHTML = `
     <div class="card-hd">
       <span class="cicon" id="ico-${id}">⏳</span>
-      <span class="curl">${shortUrl(item.url)}</span>
+      <a class="curl" id="curl-${id}" target="_blank" rel="noopener noreferrer"></a>
       <button class="ctog" id="tog-${id}">▾</button>
     </div>
     <div class="card-prog" id="prog-${id}">
@@ -476,6 +592,7 @@ function buildCard(item) {
         <button class="ccopy" data-src="sum">copy</button>
         <div class="csum" id="csum-${id}"></div>
         <div class="cdur" id="cdur-${id}"></div>
+        <a class="csrc" id="csrc-${id}" target="_blank" rel="noopener noreferrer">↗ open original post</a>
       </div>
       <div class="cpanel" data-panel="transcript">
         <button class="ccopy" data-src="tx">copy</button>
@@ -496,6 +613,14 @@ function buildCard(item) {
       </div>
     </div>
   `;
+
+  // links back to the source post — set as properties, never interpolated
+  // into the template above, so the url can't break out of the attribute
+  c.querySelectorAll(`#curl-${id}, #csrc-${id}`).forEach(a => {
+    a.href = item.url;
+    a.title = item.url;
+  });
+  c.querySelector(`#curl-${id}`).textContent = shortUrl(item.url);
 
   // tabs
   c.querySelectorAll('.ctab').forEach(t => {
@@ -581,7 +706,7 @@ function markDone(item) {
   c.className = 'card done expanded';
   const ico = $(`ico-${item.id}`); if (ico) { ico.textContent = '✓'; ico.classList.remove('spin'); }
   const tog = $(`tog-${item.id}`); if (tog) tog.textContent = '▴';
-  const sum = $(`csum-${item.id}`); if (sum) sum.textContent = item.summary;
+  const sum = $(`csum-${item.id}`); if (sum) renderMd(sum, item.summary);
   const tx  = $(`ctx-${item.id}`);  if (tx)  tx.textContent  = item.transcript;
   const dur = $(`cdur-${item.id}`); if (dur) dur.textContent = item.duration ? `video duration: ${fmtSecs(item.duration)}` : '';
   const prev = $(`cprev-${item.id}`); if (prev) prev.textContent = item.summary.slice(0, 90) + (item.summary.length > 90 ? '…' : '');
@@ -711,7 +836,7 @@ async function chatItem(item, q) {
           for (const line of chunk.split('\n')) {
             if (!line.startsWith('data:')) continue;
             let p; try { p = JSON.parse(line.slice(5).trim()); } catch { continue; }
-            if (p.type === 'token') { full += p.text; t.textContent = full; const th = $(`th-${item.id}`); if (th) th.scrollTop = th.scrollHeight; }
+            if (p.type === 'token') { full += p.text; renderMd(t, full); const th = $(`th-${item.id}`); if (th) th.scrollTop = th.scrollHeight; }
             else if (p.type === 'done')  { item.messages.push({ role: 'assistant', content: full }); return; }
             else if (p.type === 'error') throw new Error(p.message);
           }
@@ -719,7 +844,7 @@ async function chatItem(item, q) {
       }
     } finally { w.classList.remove('streaming'); }
   } catch (err) {
-    w.classList.add('error'); t.textContent = `[error] ${err.message}`;
+    w.classList.add('error'); t.classList.remove('md'); t.textContent = `[error] ${err.message}`;
     item.messages.pop();
   } finally {
     setBusy(item, false);
