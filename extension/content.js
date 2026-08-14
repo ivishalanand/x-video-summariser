@@ -142,6 +142,23 @@ function mdToHtml(src) {
     .replace(/\u0000C(\d+)\u0000/g, (_, i) => `<code>${codes[+i]}</code>`);
 }
 
+// one-line plain text for the collapsed preview — markdown syntax would only
+// show up as literal ## and ** on a single clipped line
+function stripMd(src) {
+  return String(src || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/^\s{0,3}>\s?/gm, '')
+    .replace(/^\s*(?:[-*+]|\d+[.)])\s+/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*\n]+)\*/g, '$1')
+    .replace(/(^|[^_\w])_([^_\n]+)_/g, '$1$2')
+    .replace(/\[([^\]]+)\]\([^)\s]*\)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function renderMd(el, text) {
   if (!el) return;
   el.classList.add('md');
@@ -274,6 +291,12 @@ a.curl:hover { color: #f5a623; text-decoration: underline; }
 }
 .card.done .ctog { display: block; }
 .ctog:hover { color: #f5a623; }
+.cdel {
+  background: transparent; border: none; color: #2a2a2a; font-size: 10px;
+  cursor: pointer; padding: 2px 3px; display: none; transition: color .12s; flex-shrink: 0;
+}
+.card.done .cdel, .card.err .cdel { display: block; }
+.cdel:hover { color: #ff6b6b; }
 
 /* progress inside card */
 .card-prog { padding: 0 12px 10px; display: none; }
@@ -555,6 +578,127 @@ if (tweetUrl()) toggle(true);
 
 const queue = [];
 
+// ─── history ──────────────────────────────────────────────────────────────────
+// The queue used to live only in this page's memory, so a refresh — or a second
+// x.com tab — started empty and a finished transcript was gone. Done items now
+// go to chrome.storage.local: shared by every tab, survives reload, and needs
+// no backend, so history is readable with the server stopped.
+
+const STORE_KEY = 'xsumm.history';
+const MAX_HISTORY = 50;
+const history = new Map();   // url -> stored record, insertion order irrelevant
+
+// ts = when it was summarised (ordering), mts = last touched (conflict winner)
+const byAge = recs => [...recs].sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+// Merge rather than overwrite: two x.com tabs finishing different videos at the
+// same time would otherwise clobber each other, last write winning.
+async function persist(removedUrl) {
+  let stored = [];
+  try {
+    const got = await chrome.storage.local.get(STORE_KEY);
+    stored = (got && got[STORE_KEY]) || [];
+  } catch { return; }
+  const merged = new Map(stored.filter(r => r && r.url).map(r => [r.url, r]));
+  for (const rec of history.values()) {
+    const prev = merged.get(rec.url);
+    if (!prev || (rec.mts || 0) >= (prev.mts || 0)) merged.set(rec.url, rec);
+  }
+  if (removedUrl) merged.delete(removedUrl);
+  // dropping the oldest keeps us clear of the storage quota
+  const recs = byAge(merged.values()).slice(-MAX_HISTORY);
+  const keep = new Set(recs.map(r => r.url));
+  for (const url of [...history.keys()]) if (!keep.has(url)) history.delete(url);
+  try { await chrome.storage.local.set({ [STORE_KEY]: recs }); } catch {}
+}
+
+function remember(item) {
+  item.ts = item.ts || Date.now();
+  history.set(item.url, {
+    url: item.url,
+    summary: item.summary,
+    transcript: item.transcript,
+    duration: item.duration,
+    messages: item.messages,
+    ts: item.ts,
+    mts: Date.now(),
+  });
+  persist();
+}
+
+function forget(item) {
+  history.delete(item.url);
+  const i = queue.indexOf(item);
+  if (i >= 0) queue.splice(i, 1);
+  item.el?.remove();
+  if (!queue.length) emptyEl.style.display = '';
+  persist(item.url);
+}
+
+// rebuild a finished card from storage — collapsed, chat replayed, no pipeline run
+function restoreCard(rec) {
+  const item = {
+    id: uid(), url: rec.url, status: 'done',
+    summary: rec.summary || '', transcript: rec.transcript || '',
+    duration: rec.duration || null, messages: rec.messages || [],
+    chatBusy: false, expanded: false, el: null, err: '', ts: rec.ts,
+  };
+  queue.push(item);
+  emptyEl.style.display = 'none';
+  queueEl.appendChild(buildCard(item));
+  fillCard(item, false);
+  for (const m of item.messages) appendMsg(item, m.role, m.content);
+  if (item.messages.length) $(`chips-${item.id}`)?.classList.add('gone');
+  return item;
+}
+
+function removeCardByUrl(url) {
+  const item = queue.find(i => i.url === url);
+  if (item && item.status === 'done') {
+    const i = queue.indexOf(item);
+    queue.splice(i, 1);
+    item.el?.remove();
+    if (!queue.length) emptyEl.style.display = '';
+  }
+}
+
+// another tab finished (or deleted) something — mirror it here
+function syncFromStorage(recs) {
+  const seen = new Set();
+  for (const rec of byAge((recs || []).filter(r => r && r.url))) {
+    seen.add(rec.url);
+    if (history.has(rec.url)) continue;
+    history.set(rec.url, rec);
+    if (!queue.some(i => i.url === rec.url)) restoreCard(rec);
+  }
+  for (const url of [...history.keys()]) {
+    if (seen.has(url)) continue;
+    history.delete(url);
+    removeCardByUrl(url);
+  }
+}
+
+async function hydrate() {
+  let recs = [];
+  try {
+    const got = await chrome.storage.local.get(STORE_KEY);
+    recs = (got && got[STORE_KEY]) || [];
+  } catch { return; }
+  for (const rec of byAge(recs.filter(r => r && r.url))) {
+    if (history.has(rec.url)) continue;
+    history.set(rec.url, rec);
+    if (!queue.some(i => i.url === rec.url)) restoreCard(rec);
+  }
+}
+
+try {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes[STORE_KEY]) syncFromStorage(changes[STORE_KEY].newValue || []);
+  });
+} catch {}
+
+hydrate();
+
 // ─── card builder ─────────────────────────────────────────────────────────────
 
 const STEPS = ['downloading', 'transcribing', 'summarizing'];
@@ -569,6 +713,7 @@ function buildCard(item) {
       <span class="cicon" id="ico-${id}">⏳</span>
       <a class="curl" id="curl-${id}" target="_blank" rel="noopener noreferrer"></a>
       <button class="ctog" id="tog-${id}">▾</button>
+      <button class="cdel" id="del-${id}" title="remove from history">✕</button>
     </div>
     <div class="card-prog" id="prog-${id}">
       <div class="cstep" id="sdl-${id}"><span class="mk"></span>downloading<span class="cur"> _</span>
@@ -629,6 +774,9 @@ function buildCard(item) {
       c.querySelectorAll('.cpanel').forEach(p => p.classList.toggle('active', p.dataset.panel === t.dataset.tab));
     });
   });
+
+  // drop from the sidebar and from history
+  c.querySelector(`#del-${id}`).addEventListener('click', () => forget(item));
 
   // expand toggle
   const tog = c.querySelector(`#tog-${id}`);
@@ -701,17 +849,23 @@ function txProg(item, p) {
   if (sub && pts.length) sub.textContent = pts.join(' · ');
 }
 
-function markDone(item) {
+function fillCard(item, expand) {
   const c = item.el; if (!c) return;
-  c.className = 'card done expanded';
+  c.className = expand ? 'card done expanded' : 'card done';
   const ico = $(`ico-${item.id}`); if (ico) { ico.textContent = '✓'; ico.classList.remove('spin'); }
-  const tog = $(`tog-${item.id}`); if (tog) tog.textContent = '▴';
+  const tog = $(`tog-${item.id}`); if (tog) tog.textContent = expand ? '▴' : '▾';
   const sum = $(`csum-${item.id}`); if (sum) renderMd(sum, item.summary);
   const tx  = $(`ctx-${item.id}`);  if (tx)  tx.textContent  = item.transcript;
   const dur = $(`cdur-${item.id}`); if (dur) dur.textContent = item.duration ? `video duration: ${fmtSecs(item.duration)}` : '';
-  const prev = $(`cprev-${item.id}`); if (prev) prev.textContent = item.summary.slice(0, 90) + (item.summary.length > 90 ? '…' : '');
-  item.expanded = true;
-  c.scrollIntoView({ block: 'nearest' });
+  const prev = $(`cprev-${item.id}`);
+  if (prev) { const flat = stripMd(item.summary); prev.textContent = flat.slice(0, 90) + (flat.length > 90 ? '…' : ''); }
+  item.expanded = !!expand;
+}
+
+function markDone(item) {
+  fillCard(item, true);
+  remember(item);
+  item.el?.scrollIntoView({ block: 'nearest' });
 }
 
 function markErr(item, msg) {
@@ -739,10 +893,19 @@ function markErr(item, msg) {
 function addToQueue(url) {
   url = url.trim();
   if (!isValidUrl(url)) return false;
-  // already in queue — scroll to it
+  // already here — including anything restored from history, so a video that
+  // was summarised yesterday opens instantly instead of running again
   const existing = queue.find(i => i.url === url);
-  if (existing) { existing.el?.scrollIntoView({ block: 'nearest' }); return true; }
-  const item = { id: uid(), url, status: 'processing', summary: '', transcript: '', duration: null, messages: [], chatBusy: false, expanded: false, el: null, err: '' };
+  if (existing) {
+    if (existing.status === 'done' && !existing.expanded) {
+      existing.expanded = true;
+      existing.el?.classList.add('expanded');
+      const tog = $(`tog-${existing.id}`); if (tog) tog.textContent = '▴';
+    }
+    existing.el?.scrollIntoView({ block: 'nearest' });
+    return true;
+  }
+  const item = { id: uid(), url, status: 'processing', summary: '', transcript: '', duration: null, messages: [], chatBusy: false, expanded: false, el: null, err: '', ts: Date.now() };
   queue.push(item);
   emptyEl.style.display = 'none';
   const card = buildCard(item);
@@ -796,7 +959,8 @@ function appendMsg(item, role, text) {
   const th = $(`th-${item.id}`); if (!th) return null;
   const w = document.createElement('div'); w.className = `cmsg ${role}`;
   const r = document.createElement('div'); r.className = 'cmsg-r'; r.textContent = role === 'user' ? 'you' : 'claude';
-  const t = document.createElement('div'); t.className = 'cmsg-c'; t.textContent = text || '';
+  const t = document.createElement('div'); t.className = 'cmsg-c';
+  if (role === 'assistant') renderMd(t, text || ''); else t.textContent = text || '';
   w.append(r, t); th.append(w); th.scrollTop = th.scrollHeight;
   return { w, t };
 }
@@ -837,7 +1001,7 @@ async function chatItem(item, q) {
             if (!line.startsWith('data:')) continue;
             let p; try { p = JSON.parse(line.slice(5).trim()); } catch { continue; }
             if (p.type === 'token') { full += p.text; renderMd(t, full); const th = $(`th-${item.id}`); if (th) th.scrollTop = th.scrollHeight; }
-            else if (p.type === 'done')  { item.messages.push({ role: 'assistant', content: full }); return; }
+            else if (p.type === 'done')  { item.messages.push({ role: 'assistant', content: full }); remember(item); return; }
             else if (p.type === 'error') throw new Error(p.message);
           }
         }

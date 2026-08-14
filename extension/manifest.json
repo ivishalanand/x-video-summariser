@@ -3,7 +3,7 @@
   "name": "X Video Summariser",
   "version": "1.0.0",
   "description": "Summarise X/Twitter videos in a sidebar. Requires local backend on port 47291.",
-  "permissions": ["nativeMessaging"],
+  "permissions": ["nativeMessaging", "storage"],
   "host_permissions": [
     "*://x.com/*",
     "*://twitter.com/*",
