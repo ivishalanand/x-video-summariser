@@ -46,8 +46,18 @@ _transcribe_sem = asyncio.Semaphore(1)
 # so a refresh mid-transcribe no longer leaves Whisper running.
 _cancels: dict[str, threading.Event] = {}
 
+# The backend holds the Anthropic key and listens permanently, so "*" would let
+# any open tab spend it. The extension's fetches come from its content script,
+# which in MV3 carries the page's origin (x.com / twitter.com), not
+# chrome-extension://. The localhost pair is the frontend served from "/".
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+ALLOWED_ORIGINS = [
+    "https://x.com",
+    "https://twitter.com",
+    "http://localhost:47291",
+    "http://127.0.0.1:47291",
+]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET", "POST"], allow_headers=["*"])
 
 
 class SummarizeRequest(BaseModel):

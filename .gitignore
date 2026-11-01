@@ -16,3 +16,6 @@ venv/
 
 # unrelated workspace experiment
 odm-clone/
+
+# local Claude Code config (absolute paths)
+.claude/
